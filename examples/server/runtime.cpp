@@ -265,10 +265,15 @@ std::string SDSvrParams::to_string() const {
 void refresh_lora_cache(ServerRuntime& rt) {
     std::vector<LoraEntry> new_cache;
 
-    fs::path lora_dir = rt.ctx_params->lora_model_dir;
-    if (fs::exists(lora_dir) && fs::is_directory(lora_dir)) {
-        for (auto& entry : fs::recursive_directory_iterator(lora_dir, fs::directory_options::skip_permission_denied)) {
-            if (!entry.is_regular_file()) {
+    const fs::path lora_dir = rt.ctx_params->lora_model_dir;
+    std::error_code error;
+    if (!rt.ctx_params->lora_model_dir.empty() && fs::is_directory(lora_dir, error)) {
+        for (fs::recursive_directory_iterator iterator(lora_dir, fs::directory_options::skip_permission_denied, error), end;
+             !error && iterator != end;
+             iterator.increment(error)) {
+            const fs::directory_entry& entry = *iterator;
+            if (!entry.is_regular_file(error) || error) {
+                error.clear();
                 continue;
             }
             const fs::path& p = entry.path();
@@ -307,10 +312,26 @@ std::string get_lora_full_path(ServerRuntime& rt, const std::string& path) {
 void refresh_upscaler_cache(ServerRuntime& rt) {
     std::vector<UpscalerEntry> new_cache;
 
-    fs::path upscaler_dir = rt.ctx_params->hires_upscalers_dir;
-    if (fs::exists(upscaler_dir) && fs::is_directory(upscaler_dir)) {
-        for (auto& entry : fs::directory_iterator(upscaler_dir)) {
-            if (!entry.is_regular_file()) {
+    const fs::path configured_upscaler = rt.ctx_params->esrgan_path;
+    if (!configured_upscaler.empty() && fs::exists(configured_upscaler) &&
+        fs::is_regular_file(configured_upscaler) && is_supported_model_ext(configured_upscaler)) {
+        UpscalerEntry upscaler_entry;
+        upscaler_entry.name       = configured_upscaler.stem().u8string();
+        upscaler_entry.fullpath   = fs::absolute(configured_upscaler).lexically_normal().u8string();
+        upscaler_entry.model_name = "ESRGAN_4x";
+        upscaler_entry.path       = configured_upscaler.filename().u8string();
+        new_cache.push_back(std::move(upscaler_entry));
+    }
+
+    const fs::path upscaler_dir = rt.ctx_params->hires_upscalers_dir;
+    std::error_code error;
+    if (!rt.ctx_params->hires_upscalers_dir.empty() && fs::is_directory(upscaler_dir, error)) {
+        for (fs::directory_iterator iterator(upscaler_dir, fs::directory_options::skip_permission_denied, error), end;
+             !error && iterator != end;
+             iterator.increment(error)) {
+            const fs::directory_entry& entry = *iterator;
+            if (!entry.is_regular_file(error) || error) {
+                error.clear();
                 continue;
             }
             const fs::path& p = entry.path();
@@ -324,7 +345,13 @@ void refresh_upscaler_cache(ServerRuntime& rt) {
             upscaler_entry.model_name = "ESRGAN_4x";
             upscaler_entry.path       = p.filename().u8string();
 
-            new_cache.push_back(std::move(upscaler_entry));
+            const bool already_added = std::any_of(new_cache.begin(), new_cache.end(),
+                                                   [&](const UpscalerEntry& existing) {
+                                                       return existing.fullpath == upscaler_entry.fullpath;
+                                                   });
+            if (!already_added) {
+                new_cache.push_back(std::move(upscaler_entry));
+            }
         }
     }
 
