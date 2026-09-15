@@ -21,9 +21,9 @@ struct SDSvrParams {
     std::string listen_ip = "127.0.0.1";
     int listen_port       = 1234;
     std::string serve_html_path;
-    bool normal_exit = false;
+    bool normal_exit         = false;
     sd_log_level_t log_level = SD_LOG_INFO;
-    bool color       = false;
+    bool color               = false;
 
     ArgOptions get_options();
     bool validate();
@@ -45,6 +45,13 @@ struct UpscalerEntry {
     int scale = 4;
 };
 
+struct StandaloneUpscalerRuntime {
+    std::mutex mutex;
+    UpscalerCtxPtr context;
+    std::string model_path;
+    int tile_size = 0;
+};
+
 struct ServerRuntime {
     sd_ctx_t* sd_ctx;
     std::mutex* sd_ctx_mutex;
@@ -55,6 +62,7 @@ struct ServerRuntime {
     std::mutex* lora_mutex;
     std::vector<UpscalerEntry>* upscaler_cache;
     std::mutex* upscaler_mutex;
+    StandaloneUpscalerRuntime* standalone_upscaler;
     AsyncJobManager* async_job_manager;
 };
 
@@ -78,6 +86,14 @@ struct VidGenJobRequest {
     }
 };
 
+struct UpscaleJobRequest {
+    SDImageOwner image;
+    std::string model_path;
+    int repeats            = 1;
+    int tile_size          = 128;
+    int output_compression = 100;
+};
+
 std::string base64_encode(const std::vector<uint8_t>& bytes);
 std::string normalize_output_format(std::string output_format);
 std::vector<std::string> supported_img_output_formats(bool allow_webp = true);
@@ -93,8 +109,10 @@ bool assign_output_options(VidGenJobRequest& request,
                            std::string& error_message);
 std::string video_mime_type(const std::string& output_format);
 bool runtime_supports_generation_mode(const ServerRuntime& runtime, SDMode mode);
+bool runtime_supports_upscale(const ServerRuntime& runtime);
 std::string unsupported_generation_mode_error(SDMode mode);
 void refresh_lora_cache(ServerRuntime& rt);
 std::string get_lora_full_path(ServerRuntime& rt, const std::string& path);
 void refresh_upscaler_cache(ServerRuntime& rt);
+std::string get_upscaler_full_path(ServerRuntime& rt, const std::string& path);
 int64_t unix_timestamp_now();

@@ -16,6 +16,8 @@ const char* async_job_kind_name(AsyncJobKind kind) {
             return "img_gen";
         case AsyncJobKind::VidGen:
             return "vid_gen";
+        case AsyncJobKind::Upscale:
+            return "upscale";
         default:
             return "img_gen";
     }
@@ -141,7 +143,7 @@ json make_async_job_json(const AsyncJobManager& manager, const AsyncGenerationJo
                 images.push_back({{"index", i}, {"b64_json", job.result_images_b64[i]}});
             }
             result["result"] = {
-                {"output_format", job.img_gen.output_format},
+                {"output_format", job.kind == AsyncJobKind::Upscale ? "png" : job.img_gen.output_format},
                 {"images", images},
             };
         }
@@ -150,11 +152,11 @@ json make_async_job_json(const AsyncJobManager& manager, const AsyncGenerationJo
                job.status == AsyncJobStatus::Cancelled) {
         result["result"] = nullptr;
         result["error"]  = {
-             {"code",
+            {"code",
              job.error_code.empty()
-                  ? (job.status == AsyncJobStatus::Cancelled ? "cancelled" : "generation_failed")
-                  : job.error_code},
-             {"message", job.error_message},
+                 ? (job.status == AsyncJobStatus::Cancelled ? "cancelled" : "generation_failed")
+                 : job.error_code},
+            {"message", job.error_message},
         };
     } else {
         result["result"] = nullptr;
@@ -226,6 +228,79 @@ bool execute_img_gen_job(ServerRuntime& runtime,
         return false;
     }
 
+    return true;
+}
+
+bool execute_upscale_job(ServerRuntime& runtime,
+                         AsyncGenerationJob& job,
+                         std::vector<std::string>& output_images,
+                         std::string& error_message) {
+    if (job.upscale.image.get().data == nullptr) {
+        error_message = "upscale request has no image";
+        return false;
+    }
+
+    StandaloneUpscalerRuntime& upscaler_runtime = *runtime.standalone_upscaler;
+    std::lock_guard<std::mutex> lock(upscaler_runtime.mutex);
+    if (upscaler_runtime.context == nullptr ||
+        upscaler_runtime.model_path != job.upscale.model_path ||
+        upscaler_runtime.tile_size != job.upscale.tile_size) {
+        SDContextParams context_params = *runtime.ctx_params;
+        const sd_ctx_params_t params   = context_params.to_sd_ctx_params_t(false);
+        upscaler_runtime.context.reset(new_upscaler_ctx(job.upscale.model_path.c_str(),
+                                                        runtime.ctx_params->diffusion_conv_direct,
+                                                        runtime.ctx_params->n_threads,
+                                                        job.upscale.tile_size,
+                                                        params.backend,
+                                                        params.params_backend));
+        upscaler_runtime.model_path = upscaler_runtime.context != nullptr ? job.upscale.model_path : "";
+        upscaler_runtime.tile_size  = upscaler_runtime.context != nullptr ? job.upscale.tile_size : 0;
+    }
+
+    if (upscaler_runtime.context == nullptr) {
+        error_message = "failed to load upscaler model";
+        return false;
+    }
+
+    const int upscale_factor = get_upscale_factor(upscaler_runtime.context.get());
+    if (upscale_factor <= 0) {
+        error_message = "upscaler model reported an invalid scale factor";
+        return false;
+    }
+
+    SDImageOwner image = std::move(job.upscale.image);
+    for (int index = 0; index < job.upscale.repeats; ++index) {
+        sd_image_t* raw_images = nullptr;
+        int image_count        = 0;
+        if (!upscale(upscaler_runtime.context.get(),
+                     image.get(),
+                     static_cast<uint32_t>(upscale_factor),
+                     &raw_images,
+                     &image_count) ||
+            image_count <= 0 || raw_images == nullptr || raw_images[0].data == nullptr) {
+            free_sd_images(raw_images, image_count);
+            error_message = "upscale returned no image";
+            return false;
+        }
+
+        sd_image_t result = raw_images[0];
+        raw_images[0]     = {0, 0, 0, nullptr};
+        free_sd_images(raw_images, image_count);
+        image.reset(result);
+    }
+
+    const auto bytes = encode_image_to_vector(EncodedImageFormat::PNG,
+                                              image.get().data,
+                                              static_cast<int>(image.get().width),
+                                              static_cast<int>(image.get().height),
+                                              static_cast<int>(image.get().channel),
+                                              "",
+                                              job.upscale.output_compression);
+    if (bytes.empty()) {
+        error_message = "failed to encode upscaled PNG";
+        return false;
+    }
+    output_images.push_back(base64_encode(bytes));
     return true;
 }
 
@@ -326,6 +401,8 @@ void async_job_worker(ServerRuntime& runtime) {
                                      output_frame_count,
                                      output_fps,
                                      error_message);
+        } else if (job->kind == AsyncJobKind::Upscale) {
+            ok = execute_upscale_job(runtime, *job, output_images, error_message);
         } else {
             error_message = "unsupported job kind";
         }

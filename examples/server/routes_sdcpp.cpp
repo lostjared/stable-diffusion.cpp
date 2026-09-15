@@ -199,22 +199,33 @@ static json make_vid_gen_features_json() {
     };
 }
 
+static json make_upscale_features_json() {
+    return {
+        {"image", true},
+        {"upscaler", true},
+        {"upscale_repeats", true},
+        {"cancel_queued", true},
+        {"cancel_generating", false},
+    };
+}
+
 static json make_capabilities_json(ServerRuntime& runtime) {
     refresh_lora_cache(runtime);
     refresh_upscaler_cache(runtime);
 
-    AsyncJobManager& manager  = *runtime.async_job_manager;
-    const auto& defaults      = *runtime.default_gen_params;
-    const fs::path model_path = resolve_display_model_path(runtime);
-    const bool supports_img   = runtime_supports_generation_mode(runtime, IMG_GEN);
-    const bool supports_vid   = runtime_supports_generation_mode(runtime, VID_GEN);
-    json samplers             = json::array();
-    json schedulers           = json::array();
-    json image_output_formats = supported_img_output_formats();
-    json video_output_formats = supported_vid_output_formats();
-    json available_loras      = json::array();
-    json available_upscalers  = json::array();
-    json supported_modes      = json::array();
+    AsyncJobManager& manager    = *runtime.async_job_manager;
+    const auto& defaults        = *runtime.default_gen_params;
+    const fs::path model_path   = resolve_display_model_path(runtime);
+    const bool supports_img     = runtime_supports_generation_mode(runtime, IMG_GEN);
+    const bool supports_vid     = runtime_supports_generation_mode(runtime, VID_GEN);
+    const bool supports_upscale = runtime_supports_upscale(runtime);
+    json samplers               = json::array();
+    json schedulers             = json::array();
+    json image_output_formats   = supported_img_output_formats();
+    json video_output_formats   = supported_vid_output_formats();
+    json available_loras        = json::array();
+    json available_upscalers    = json::array();
+    json supported_modes        = json::array();
 
     for (int i = 0; i < SAMPLE_METHOD_COUNT; ++i) {
         samplers.push_back(sd_sample_method_name((sample_method_t)i));
@@ -279,6 +290,9 @@ static json make_capabilities_json(ServerRuntime& runtime) {
     if (supports_vid) {
         supported_modes.push_back("vid_gen");
     }
+    if (supports_upscale) {
+        supported_modes.push_back("upscale");
+    }
 
     std::string default_img_output_format = "png";
     std::string default_vid_output_format = "avi";
@@ -302,12 +316,22 @@ static json make_capabilities_json(ServerRuntime& runtime) {
         output_formats_by_mode["vid_gen"] = video_output_formats;
         features_by_mode["vid_gen"]       = make_vid_gen_features_json();
     }
+    if (supports_upscale) {
+        defaults_by_mode["upscale"] = {
+            {"output_format", "png"},
+            {"output_compression", 100},
+            {"upscale_repeats", 1},
+            {"upscale_tile_size", 128},
+        };
+        output_formats_by_mode["upscale"] = {"png"};
+        features_by_mode["upscale"]       = make_upscale_features_json();
+    }
 
     json top_level_defaults       = json::object();
     json top_level_output_formats = json::array();
     json top_level_features       = {
-              {"cancel_queued", true},
-              {"cancel_generating", false},
+        {"cancel_queued", true},
+        {"cancel_generating", false},
     };
     std::string current_mode = "";
     if (supports_img) {
@@ -320,6 +344,11 @@ static json make_capabilities_json(ServerRuntime& runtime) {
         top_level_defaults       = defaults_by_mode["vid_gen"];
         top_level_output_formats = output_formats_by_mode["vid_gen"];
         top_level_features       = features_by_mode["vid_gen"];
+    } else if (supports_upscale) {
+        current_mode             = "upscale";
+        top_level_defaults       = defaults_by_mode["upscale"];
+        top_level_output_formats = output_formats_by_mode["upscale"];
+        top_level_features       = features_by_mode["upscale"];
     }
 
     json result;
@@ -333,12 +362,12 @@ static json make_capabilities_json(ServerRuntime& runtime) {
     result["defaults"]         = top_level_defaults;
     result["defaults_by_mode"] = defaults_by_mode;
     result["limits"]           = {
-                  {"min_width", 64},
-                  {"max_width", 4096},
-                  {"min_height", 64},
-                  {"max_height", 4096},
-                  {"max_batch_count", 8},
-                  {"max_queue_size", manager.max_pending_jobs},
+        {"min_width", 64},
+        {"max_width", 4096},
+        {"min_height", 64},
+        {"max_height", 4096},
+        {"max_batch_count", 8},
+        {"max_queue_size", manager.max_pending_jobs},
     };
     result["samplers"]               = samplers;
     result["schedulers"]             = schedulers;
@@ -400,6 +429,40 @@ static bool parse_vid_gen_request(const json& body,
     // Intentionally disable prompt-embedded LoRA tag parsing for server APIs.
     if (!request.gen_params.resolve_and_validate(VID_GEN, "", runtime.ctx_params->hires_upscalers_dir, true)) {
         error_message = "invalid generation parameters";
+        return false;
+    }
+    return true;
+}
+
+static bool parse_upscale_request(const json& body,
+                                  ServerRuntime& runtime,
+                                  UpscaleJobRequest& request,
+                                  std::string& error_message) {
+    if (!body.contains("image") || !body.at("image").is_string() ||
+        !decode_base64_image(body.at("image").get<std::string>(), 3, 0, 0, request.image)) {
+        error_message = "image must be a base64-encoded PNG, JPEG, or WebP image";
+        return false;
+    }
+
+    refresh_upscaler_cache(runtime);
+    const std::string requested_model = body.value("upscaler", "");
+    request.model_path                = requested_model.empty()
+                                            ? runtime.ctx_params->esrgan_path
+                                            : get_upscaler_full_path(runtime, requested_model);
+    if (request.model_path.empty()) {
+        error_message = "requested upscaler is unavailable; configure --upscale-model or --hires-upscalers-dir";
+        return false;
+    }
+
+    request.repeats            = body.value("upscale_repeats", 1);
+    request.tile_size          = body.value("upscale_tile_size", 128);
+    request.output_compression = std::clamp(body.value("output_compression", 100), 0, 100);
+    if (request.repeats < 1 || request.repeats > 3) {
+        error_message = "upscale_repeats must be between 1 and 3";
+        return false;
+    }
+    if (request.tile_size < 16 || request.tile_size > 2048) {
+        error_message = "upscale_tile_size must be between 16 and 2048";
         return false;
     }
     return true;
@@ -472,6 +535,67 @@ void register_sdcpp_api_endpoints(httplib::Server& svr, ServerRuntime& rt) {
         } catch (const std::exception& e) {
             res.status = 500;
             res.set_content(json({{"error", "server_error"}, {"message", e.what()}}).dump(), "application/json");
+        }
+    });
+
+    svr.Post("/sdcpp/v1/upscale", [runtime](const httplib::Request& req, httplib::Response& res) {
+        try {
+            if (req.body.empty()) {
+                res.status = 400;
+                res.set_content(R"({"error":"empty body"})", "application/json");
+                return;
+            }
+            refresh_upscaler_cache(*runtime);
+            if (!runtime_supports_upscale(*runtime)) {
+                res.status = 400;
+                res.set_content(R"({"error":"no upscaler model is configured"})", "application/json");
+                return;
+            }
+
+            json body = json::parse(req.body);
+            UpscaleJobRequest request;
+            std::string error_message;
+            if (!parse_upscale_request(body, *runtime, request, error_message)) {
+                res.status = 400;
+                res.set_content(json({{"error", error_message}}).dump(), "application/json");
+                return;
+            }
+
+            AsyncJobManager& manager                = *runtime->async_job_manager;
+            std::shared_ptr<AsyncGenerationJob> job = std::make_shared<AsyncGenerationJob>();
+            job->kind                               = AsyncJobKind::Upscale;
+            job->status                             = AsyncJobStatus::Queued;
+            job->created_at                         = unix_timestamp_now();
+            job->upscale                            = std::move(request);
+
+            {
+                std::lock_guard<std::mutex> lock(manager.mutex);
+                purge_expired_jobs(manager);
+                if (count_pending_jobs(manager) >= manager.max_pending_jobs) {
+                    res.status = 429;
+                    res.set_content(R"({"error":"job queue is full"})", "application/json");
+                    return;
+                }
+                job->id               = make_async_job_id(manager);
+                manager.jobs[job->id] = job;
+                manager.queue.push_back(job->id);
+            }
+            manager.cv.notify_one();
+
+            json out;
+            out["id"]       = job->id;
+            out["kind"]     = async_job_kind_name(job->kind);
+            out["status"]   = async_job_status_name(job->status);
+            out["created"]  = job->created_at;
+            out["poll_url"] = "/sdcpp/v1/jobs/" + job->id;
+            res.status      = 202;
+            res.set_content(out.dump(), "application/json");
+        } catch (const json::parse_error& error) {
+            res.status = 400;
+            res.set_content(json({{"error", "invalid json"}, {"message", error.what()}}).dump(), "application/json");
+        } catch (const std::exception& error) {
+            res.status = 500;
+            res.set_content(json({{"error", "server_error"}, {"message", error.what()}}).dump(), "application/json");
         }
     });
 

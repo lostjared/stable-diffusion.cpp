@@ -167,6 +167,9 @@ std::string video_mime_type(const std::string& output_format) {
 }
 
 bool runtime_supports_generation_mode(const ServerRuntime& runtime, SDMode mode) {
+    if (runtime.sd_ctx == nullptr) {
+        return false;
+    }
     if (mode == VID_GEN) {
         return sd_ctx_supports_video_generation(runtime.sd_ctx);
     }
@@ -174,6 +177,14 @@ bool runtime_supports_generation_mode(const ServerRuntime& runtime, SDMode mode)
         return sd_ctx_supports_image_generation(runtime.sd_ctx);
     }
     return true;
+}
+
+bool runtime_supports_upscale(const ServerRuntime& runtime) {
+    if (!runtime.ctx_params->esrgan_path.empty()) {
+        return true;
+    }
+    std::lock_guard<std::mutex> lock(*runtime.upscaler_mutex);
+    return !runtime.upscaler_cache->empty();
 }
 
 std::string unsupported_generation_mode_error(SDMode mode) {
@@ -325,6 +336,14 @@ void refresh_upscaler_cache(ServerRuntime& rt) {
         std::lock_guard<std::mutex> lock(*rt.upscaler_mutex);
         *rt.upscaler_cache = std::move(new_cache);
     }
+}
+
+std::string get_upscaler_full_path(ServerRuntime& rt, const std::string& path) {
+    std::lock_guard<std::mutex> lock(*rt.upscaler_mutex);
+    auto it = std::find_if(rt.upscaler_cache->begin(), rt.upscaler_cache->end(), [&](const UpscalerEntry& entry) {
+        return entry.name == path || entry.path == path;
+    });
+    return it != rt.upscaler_cache->end() ? it->fullpath : "";
 }
 
 int64_t unix_timestamp_now() {

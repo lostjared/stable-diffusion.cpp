@@ -49,11 +49,13 @@ static void parse_args(int argc,
 
     const bool random_seed_requested = default_gen_params.seed < 0;
 
+    const bool has_generation_model = !ctx_params.model_path.empty() || !ctx_params.diffusion_model_path.empty();
+    const SDMode server_mode        = has_generation_model ? IMG_GEN : UPSCALE;
     if (!svr_params.resolve_and_validate() ||
-        !ctx_params.resolve_and_validate(IMG_GEN) ||
-        !default_gen_params.resolve_and_validate(IMG_GEN,
-                                                 ctx_params.lora_model_dir,
-                                                 ctx_params.hires_upscalers_dir)) {
+        !ctx_params.resolve_and_validate(server_mode) ||
+        (has_generation_model && !default_gen_params.resolve_and_validate(IMG_GEN,
+                                                                          ctx_params.lora_model_dir,
+                                                                          ctx_params.hires_upscalers_dir))) {
         print_usage(argv[0], options_vec);
         exit(1);
     }
@@ -86,12 +88,15 @@ int main(int argc, const char** argv) {
     LOG_VERBOSE("%s", ctx_params.to_string().c_str());
     LOG_VERBOSE("%s", default_gen_params.to_string().c_str());
 
-    sd_ctx_params_t sd_ctx_params = ctx_params.to_sd_ctx_params_t(false);
-    SDCtxPtr sd_ctx(new_sd_ctx(&sd_ctx_params));
-
-    if (sd_ctx == nullptr) {
-        LOG_ERROR("new_sd_ctx_t failed");
-        return 1;
+    const bool has_generation_model = !ctx_params.model_path.empty() || !ctx_params.diffusion_model_path.empty();
+    SDCtxPtr sd_ctx;
+    if (has_generation_model) {
+        sd_ctx_params_t sd_ctx_params = ctx_params.to_sd_ctx_params_t(false);
+        sd_ctx.reset(new_sd_ctx(&sd_ctx_params));
+        if (sd_ctx == nullptr) {
+            LOG_ERROR("new_sd_ctx_t failed");
+            return 1;
+        }
     }
 
     std::mutex sd_ctx_mutex;
@@ -100,6 +105,7 @@ int main(int argc, const char** argv) {
     std::mutex lora_mutex;
     std::vector<UpscalerEntry> upscaler_cache;
     std::mutex upscaler_mutex;
+    StandaloneUpscalerRuntime standalone_upscaler;
     AsyncJobManager async_job_manager;
     ServerRuntime runtime = {
         sd_ctx.get(),
@@ -111,6 +117,7 @@ int main(int argc, const char** argv) {
         &lora_mutex,
         &upscaler_cache,
         &upscaler_mutex,
+        &standalone_upscaler,
         &async_job_manager,
     };
 
